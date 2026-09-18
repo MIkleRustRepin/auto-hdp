@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-hdp"
+version = "0.1.0"
+description = "Capture HDP assignments from the latest active subject module"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "playwright>=1.55,<2",
+  "python-dotenv>=1.1,<2",
+]
+
+[project.scripts]
+auto-hdp = "auto_hdp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
