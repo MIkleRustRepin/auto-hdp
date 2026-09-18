@@ -5,8 +5,11 @@ from auto_hdp.platform import (
     HdpError,
     Subject,
     choose_latest_active_module,
+    is_unsolved_level_task,
     select_module,
     select_subject,
+    task_level,
+    task_progress_status,
 )
 
 
@@ -38,6 +41,28 @@ class FakeContext:
 
 
 class PlatformSelectionTest(unittest.TestCase):
+    def test_unsolved_task_filter_uses_level_and_progress(self) -> None:
+        task = {
+            "levelId": 3.0,
+            "progress": {"status": {"type": "appointed"}},
+        }
+        self.assertTrue(is_unsolved_level_task(task))
+        self.assertEqual(task_level(task), 3)
+        self.assertEqual(task_progress_status(task), "appointed")
+
+        for status in ("approved", "reviewing", "submitted"):
+            task["progress"]["status"]["type"] = status
+            self.assertFalse(is_unsolved_level_task(task))
+
+        task["progress"]["status"]["type"] = "appointed"
+        task["levelId"] = "4.0"
+        self.assertFalse(is_unsolved_level_task(task))
+
+    def test_unsolved_task_filter_accepts_missing_progress(self) -> None:
+        self.assertTrue(is_unsolved_level_task({"levelId": "1.0"}))
+        self.assertFalse(is_unsolved_level_task({"levelId": 2, "hidden": True}))
+        self.assertFalse(is_unsolved_level_task({"levelId": "unknown"}))
+
     def test_latest_started_wins_over_newer_planned(self) -> None:
         selected = choose_latest_active_module(
             {

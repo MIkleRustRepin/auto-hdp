@@ -14,13 +14,23 @@ from dotenv import load_dotenv
 from playwright.sync_api import Browser, BrowserType, Error as PlaywrightError, sync_playwright
 
 from .capture import capture_task_page, safe_name, save_task_source, write_json
+from .codex_solver import (
+    CodexError,
+    capture_screenshots,
+    codex_connection,
+    solve_with_codex,
+)
 from .platform import (
     HdpClient,
     HdpError,
+    INELIGIBLE_TASK_PROGRESS_STATUSES,
     Subject,
     choose_latest_active_module,
+    is_unsolved_level_task,
     select_module,
     select_subject,
+    task_level,
+    task_progress_status,
 )
 
 
@@ -48,6 +58,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default="https://horodigital.ru")
     parser.add_argument("--headed", action="store_true", help="Показать окно браузера")
     parser.add_argument("--timeout", type=int, default=30, help="Таймаут в секундах")
+    parser.add_argument(
+        "--all-tasks",
+        action="store_true",
+        help="Снять все задания, включая выполненные, проверяемые и уровень 4",
+    )
+    parser.add_argument(
+        "--solve-with-codex",
+        "--codex",
+        action="store_true",
+        help="Отправить скриншоты каждого выбранного задания в Codex CLI",
+    )
+    parser.add_argument(
+        "--codex-prompt",
+        default="Реши",
+        help="Текст, отправляемый в Codex вместе со скриншотами",
+    )
+    parser.add_argument(
+        "--codex-model",
+        help="Модель Codex; без аргумента используется модель из конфигурации Codex CLI",
+    )
+    parser.add_argument(
+        "--codex-timeout",
+        type=int,
+        default=600,
+        help="Таймаут одного ответа Codex в секундах",
+    )
     return parser
 
 
@@ -145,6 +181,7 @@ def _run(args: argparse.Namespace) -> Path:
     login = os.getenv("HDP_LOGIN", "").strip()
     password = os.getenv("HDP_PASSWORD", "")
     cached_state = _read_auth_state(args.auth_state)
+    codex_executable = codex_connection() if args.solve_with_codex else None
 
     timeout_ms = max(1, args.timeout) * 1_000
     with sync_playwright() as playwright:
@@ -180,11 +217,21 @@ def _run(args: argparse.Namespace) -> Path:
             )
             print(f"Модуль: {module.get('title', module.get('uuid'))}")
             module_data = client.module_with_tasks(str(module["uuid"]))
-            tasks = [
+            visible_tasks = [
                 task
                 for task in module_data.get("tasks", [])
                 if isinstance(task, dict) and task.get("hidden") is not True
             ]
+            tasks = (
+                visible_tasks
+                if args.all_tasks
+                else [task for task in visible_tasks if is_unsolved_level_task(task)]
+            )
+            if not args.all_tasks:
+                print(
+                    "Фильтр: уровни 1/2/3, не выполнено и не на проверке — "
+                    f"{len(tasks)} из {len(visible_tasks)} заданий"
+                )
 
             timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
             run_dir = (
@@ -203,6 +250,20 @@ def _run(args: argparse.Namespace) -> Path:
                 },
                 "module": _public_module(module_data),
                 "task_count": len(tasks),
+                "available_task_count": len(visible_tasks),
+                "filter": {
+                    "mode": "all" if args.all_tasks else "unsolved-levels-1-2-3",
+                    "levels": None if args.all_tasks else [1, 2, 3],
+                    "excluded_progress_statuses": None
+                    if args.all_tasks
+                    else sorted(INELIGIBLE_TASK_PROGRESS_STATUSES),
+                },
+                "solver": {
+                    "enabled": args.solve_with_codex,
+                    "provider": "codex-cli" if args.solve_with_codex else None,
+                    "model": args.codex_model if args.solve_with_codex else None,
+                    "prompt": args.codex_prompt if args.solve_with_codex else None,
+                },
                 "tasks": [],
             }
             write_json(run_dir / "manifest.json", manifest)
@@ -218,6 +279,8 @@ def _run(args: argparse.Namespace) -> Path:
                     "title": task_title,
                     "type": task.get("type"),
                     "status": task.get("status"),
+                    "level_id": task_level(task),
+                    "progress_status": task_progress_status(task),
                     "directory": task_dir.name,
                 }
                 print(f"[{ordinal}/{len(tasks)}] {task_title}")
@@ -240,6 +303,21 @@ def _run(args: argparse.Namespace) -> Path:
                 except Exception as exc:
                     record["capture"] = {"status": "error", "reason": str(exc)}
                     print(f"  Ошибка: {exc}", file=sys.stderr)
+                if codex_executable is not None:
+                    screenshots = capture_screenshots(task_dir, record["capture"])
+                    try:
+                        record["solution"] = solve_with_codex(
+                            codex_executable,
+                            screenshots,
+                            task_dir / "solution.txt",
+                            prompt=args.codex_prompt,
+                            model=args.codex_model,
+                            timeout_seconds=args.codex_timeout,
+                        )
+                        print(f"  Codex: {task_dir / 'solution.txt'}")
+                    except CodexError as exc:
+                        record["solution"] = {"status": "error", "reason": str(exc)}
+                        print(f"  Ошибка Codex: {exc}", file=sys.stderr)
                 manifest["tasks"].append(record)
                 write_json(run_dir / "manifest.json", manifest)
                 time.sleep(0.2)
@@ -254,7 +332,7 @@ def main() -> None:
     args = build_parser().parse_args()
     try:
         run_dir = _run(args)
-    except (HdpError, KeyboardInterrupt) as exc:
+    except (CodexError, HdpError, KeyboardInterrupt) as exc:
         print(f"Ошибка: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     print(f"Готово: {run_dir.resolve()}")

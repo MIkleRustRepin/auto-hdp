@@ -18,6 +18,51 @@ class Subject:
     name: str
 
 
+INELIGIBLE_TASK_PROGRESS_STATUSES = frozenset(
+    {
+        "accepted",
+        "approved",
+        "completed",
+        "done",
+        "passed",
+        "reviewing",
+        "submitted",
+    }
+)
+
+
+def task_level(task: dict[str, Any]) -> int | None:
+    """Return an integer HDP level for values such as 1, 1.0, or "1.0"."""
+    value = task.get("levelId")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not numeric.is_integer():
+        return None
+    return int(numeric)
+
+
+def task_progress_status(task: dict[str, Any]) -> str | None:
+    progress = task.get("progress")
+    if not isinstance(progress, dict):
+        return None
+    status = progress.get("status")
+    if not isinstance(status, dict):
+        return None
+    value = status.get("type")
+    return value.strip().casefold() if isinstance(value, str) and value.strip() else None
+
+
+def is_unsolved_level_task(task: dict[str, Any]) -> bool:
+    """Select unfinished/non-reviewing tasks from HDP levels 1, 2, and 3."""
+    return (
+        task.get("hidden") is not True
+        and task_level(task) in {1, 2, 3}
+        and task_progress_status(task) not in INELIGIBLE_TASK_PROGRESS_STATUSES
+    )
+
+
 def _date_key(module: dict[str, Any]) -> tuple[date, str]:
     period = module.get("studyPeriod") or {}
     raw = period.get("startDate") or "0001-01-01"

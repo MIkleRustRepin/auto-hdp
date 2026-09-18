@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "auto-hdp"
-version = "0.1.0"
-description = "Capture HDP assignments from the latest active subject module"
+version = "0.2.0"
+description = "Capture and optionally solve unfinished HDP assignments"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
