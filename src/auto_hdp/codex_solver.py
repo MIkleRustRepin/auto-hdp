@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from openai_codex import AsyncCodex, Codex, CodexConfig, LocalImageInput, Sandbox, TextInput
+from openai_codex import (
+    AsyncCodex,
+    Codex,
+    CodexConfig,
+    LocalImageInput,
+    Sandbox,
+    TextInput,
+    retry_on_overload,
+)
 from openai_codex.errors import CodexError as SdkCodexError
 from openai_codex.types import ReasoningEffort
 
@@ -95,6 +104,37 @@ async def _run_codex_turn(
     return result.final_response
 
 
+def _run_codex_turn_in_worker(
+    screenshots: list[Path],
+    *,
+    prompt: str,
+    model: str,
+    effort: str,
+    working_directory: Path,
+    timeout_seconds: int,
+) -> str:
+    """Run the SDK loop outside Playwright's synchronous event-loop thread."""
+
+    async def run_with_timeout() -> str:
+        return await asyncio.wait_for(
+            _run_codex_turn(
+                screenshots,
+                prompt=prompt,
+                model=model,
+                effort=effort,
+                working_directory=working_directory,
+            ),
+            timeout=max(1, timeout_seconds),
+        )
+
+    return retry_on_overload(
+        lambda: asyncio.run(run_with_timeout()),
+        max_attempts=5,
+        initial_delay_s=2,
+        max_delay_s=15,
+    )
+
+
 def solve_with_codex(
     screenshots: list[Path],
     output_path: Path,
@@ -112,18 +152,17 @@ def solve_with_codex(
 
     try:
         with tempfile.TemporaryDirectory(prefix="auto-hdp-codex-") as temporary:
-            answer = asyncio.run(
-                asyncio.wait_for(
-                    _run_codex_turn(
-                        screenshots,
-                        prompt=prompt,
-                        model=model,
-                        effort=effort,
-                        working_directory=Path(temporary),
-                    ),
-                    timeout=max(1, timeout_seconds),
-                )
-            ).strip()
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="auto-hdp-codex") as pool:
+                answer = pool.submit(
+                    _run_codex_turn_in_worker,
+                    screenshots,
+                    prompt=prompt,
+                    model=model,
+                    effort=effort,
+                    working_directory=Path(temporary),
+                    timeout_seconds=timeout_seconds,
+                ).result()
+            answer = answer.strip()
     except TimeoutError as exc:
         raise CodexError(f"Codex не ответил за {timeout_seconds} секунд") from exc
     except SdkCodexError as exc:

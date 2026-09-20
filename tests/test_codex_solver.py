@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from openai_codex import LocalImageInput, Sandbox, TextInput
+from openai_codex import LocalImageInput, Sandbox, ServerBusyError, TextInput
 from openai_codex.types import ReasoningEffort
 
 from auto_hdp.codex_solver import (
@@ -51,7 +51,11 @@ class CodexSolverTest(unittest.TestCase):
                 new_callable=AsyncMock,
                 return_value="Готовый ответ",
             ) as run:
-                result = solve_with_codex([screenshot], output, timeout_seconds=20)
+
+                async def call_while_event_loop_is_running():
+                    return solve_with_codex([screenshot], output, timeout_seconds=20)
+
+                result = asyncio.run(call_while_event_loop_is_running())
 
             self.assertEqual(run.await_args.kwargs["model"], "gpt-5.6-terra")
             self.assertEqual(run.await_args.kwargs["effort"], "low")
@@ -101,6 +105,27 @@ class CodexSolverTest(unittest.TestCase):
             self.assertEqual(observed["start"]["model"], "gpt-5.6-terra")
             self.assertEqual(observed["start"]["sandbox"], Sandbox.read_only)
             self.assertEqual(observed["run"]["effort"], ReasoningEffort.low)
+
+    def test_transient_capacity_error_is_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            screenshot = directory / "page.png"
+            screenshot.write_bytes(b"png")
+            output = directory / "solution.txt"
+
+            with (
+                patch(
+                    "auto_hdp.codex_solver._run_codex_turn",
+                    new_callable=AsyncMock,
+                    side_effect=[ServerBusyError(-1, "at capacity"), "Ответ после повтора"],
+                ) as run,
+                patch("openai_codex.retry.time.sleep"),
+            ):
+                result = solve_with_codex([screenshot], output, timeout_seconds=20)
+
+            self.assertEqual(run.await_count, 2)
+            self.assertEqual(result["status"], "solved")
+            self.assertEqual(output.read_text(encoding="utf-8"), "Ответ после повтора\n")
 
 
 if __name__ == "__main__":

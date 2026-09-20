@@ -1,4 +1,7 @@
 import unittest
+from unittest.mock import patch
+
+from playwright.sync_api import Error as PlaywrightError
 
 from auto_hdp.platform import (
     HdpClient,
@@ -29,7 +32,10 @@ class FakeRequest:
         self.posts = list(posts or [])
 
     def get(self, _url):
-        return self.gets.pop(0)
+        result = self.gets.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     def post(self, _url, **_kwargs):
         return self.posts.pop(0)
@@ -115,6 +121,21 @@ class PlatformSelectionTest(unittest.TestCase):
 
 
 class AuthenticationTest(unittest.TestCase):
+    def test_network_get_is_retried_without_leaking_call_log(self) -> None:
+        request = FakeRequest(
+            gets=[
+                PlaywrightError("socket hang up\nCall log:\n  cookie: secret"),
+                FakeResponse(200, {"success": True, "data": ["ok"]}),
+            ]
+        )
+        client = HdpClient(FakeContext(request), "https://example.test")
+
+        with patch("auto_hdp.platform.time.sleep") as sleep:
+            response = client._get("/tasks", "Получение заданий")
+
+        self.assertEqual(response.json()["data"], ["ok"])
+        sleep.assert_called_once()
+
     def test_denied_get_refreshes_session_and_retries_once(self) -> None:
         request = FakeRequest(
             gets=[

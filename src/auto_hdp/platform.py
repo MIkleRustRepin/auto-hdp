@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import time
 from typing import Any, Callable
 
-from playwright.sync_api import APIResponse, BrowserContext
+from playwright.sync_api import APIResponse, BrowserContext, Error as PlaywrightError
 
 
 class HdpError(RuntimeError):
@@ -201,10 +202,27 @@ class HdpClient:
             self._on_auth_refreshed()
 
     def _get(self, path: str, operation: str) -> APIResponse:
-        response = self.context.request.get(self._url(path))
+        response: APIResponse | None = None
+        for attempt in range(3):
+            try:
+                response = self.context.request.get(self._url(path))
+                break
+            except PlaywrightError:
+                if attempt == 2:
+                    raise HdpError(
+                        f"{operation}: сетевая ошибка после трёх попыток"
+                    ) from None
+                time.sleep(0.5 * (attempt + 1))
+        if response is None:
+            raise HdpError(f"{operation}: запрос не вернул ответ")
         if response.status in (401, 403):
             self.refresh_authentication()
-            response = self.context.request.get(self._url(path))
+            try:
+                response = self.context.request.get(self._url(path))
+            except PlaywrightError:
+                raise HdpError(
+                    f"{operation}: сетевая ошибка после обновления авторизации"
+                ) from None
         if response.status in (401, 403):
             raise HdpError(f"{operation}: доступ запрещён после обновления сессии")
         return response

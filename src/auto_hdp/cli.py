@@ -52,6 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Точное название или UUID модуля; без аргумента берётся последний активный",
     )
     parser.add_argument("--output", type=Path, default=Path("output"))
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        help="Продолжить незавершённый каталог запуска без повторной обработки готовых заданий",
+    )
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument(
         "--auth-state",
@@ -116,6 +121,53 @@ def _interactive_subject(subjects: list[Subject]) -> Subject:
 def _public_module(module: dict[str, Any]) -> dict[str, Any]:
     keys = ("uuid", "title", "disciplineId", "stageId", "studyPeriod", "status")
     return {key: module.get(key) for key in keys}
+
+
+def _safe_error(exc: BaseException) -> str:
+    """Keep diagnostics useful without persisting request headers or cookies."""
+    message = str(exc).split("Call log:", 1)[0].strip()
+    first_line = message.splitlines()[0].strip() if message else type(exc).__name__
+    return first_line[:500]
+
+
+def _capture_from_disk(directory: Path) -> dict[str, Any] | None:
+    """Reconstruct enough capture metadata to resume from existing PNG files."""
+    page_png = directory / "page.png"
+    question_pngs = sorted(directory.glob("question-*.png"))
+    if not page_png.is_file() and not question_pngs:
+        return None
+
+    artifacts: dict[str, str] = {}
+    if page_png.is_file():
+        artifacts["screenshot"] = page_png.name
+    page_html = directory / "page.html"
+    if page_html.is_file():
+        artifacts["html"] = page_html.name
+
+    questions: list[dict[str, Any]] = []
+    for index, png in enumerate(question_pngs, start=1):
+        item: dict[str, Any] = {"index": index, "screenshot": png.name}
+        html = png.with_suffix(".html")
+        if html.is_file():
+            item["html"] = html.name
+        questions.append(item)
+
+    capture: dict[str, Any] = {"status": "captured", "artifacts": artifacts}
+    if questions:
+        capture["total"] = len(questions)
+        capture["questions"] = questions
+    return capture
+
+
+def _load_task_json(directory: Path) -> dict[str, Any] | None:
+    path = directory / "task.json"
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _launch_browser(browser_type: BrowserType, headed: bool) -> Browser:
@@ -245,14 +297,33 @@ def _run(args: argparse.Namespace) -> Path:
                     f"{len(tasks)} из {len(visible_tasks)} заданий"
                 )
 
-            timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-            run_dir = (
-                args.output
-                / safe_name(subject.name, f"subject-{subject.discipline_id}")
-                / f"{timestamp}-{safe_name(str(module.get('title', 'module')))}"
-            )
-            run_dir.mkdir(parents=True, exist_ok=False)
-            manifest: dict[str, Any] = {
+            manifest_path: Path
+            if args.resume:
+                run_dir = args.resume
+                manifest_path = run_dir / "manifest.json"
+                if not manifest_path.is_file():
+                    raise HdpError(f"В каталоге возобновления нет manifest.json: {run_dir}")
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise HdpError(f"Не удалось прочитать manifest.json: {_safe_error(exc)}") from exc
+                if not isinstance(manifest, dict) or not isinstance(manifest.get("tasks"), list):
+                    raise HdpError("Некорректный manifest.json для возобновления")
+                manifest_module = manifest.get("module") or {}
+                if str(manifest_module.get("uuid", "")) != str(module.get("uuid", "")):
+                    raise HdpError("Каталог возобновления относится к другому модулю")
+                manifest["resumed_at"] = datetime.now().astimezone().isoformat()
+                print(f"Продолжение: {run_dir}")
+            else:
+                timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+                run_dir = (
+                    args.output
+                    / safe_name(subject.name, f"subject-{subject.discipline_id}")
+                    / f"{timestamp}-{safe_name(str(module.get('title', 'module')))}"
+                )
+                run_dir.mkdir(parents=True, exist_ok=False)
+                manifest_path = run_dir / "manifest.json"
+                manifest = {
                 "created_at": datetime.now().astimezone().isoformat(),
                 "base_url": args.base_url,
                 "subject": {
@@ -282,15 +353,28 @@ def _run(args: argparse.Namespace) -> Path:
                     "prompt": args.codex_prompt if args.solve_with_codex else None,
                 },
                 "tasks": [],
+                }
+            manifest["task_count"] = len(tasks)
+            manifest["available_task_count"] = len(visible_tasks)
+            write_json(manifest_path, manifest)
+            existing_records = {
+                str(record.get("uuid")): record
+                for record in manifest["tasks"]
+                if isinstance(record, dict) and record.get("uuid")
             }
-            write_json(run_dir / "manifest.json", manifest)
             page = context.new_page()
             for ordinal, task in enumerate(tasks, start=1):
                 task_uuid = str(task.get("uuid", ""))
                 task_title = str(task.get("title", f"task-{ordinal}"))
-                task_dir = run_dir / f"{ordinal:03d}-{safe_name(task_title)}-{task_uuid[:8]}"
-                task_dir.mkdir(parents=True)
-                record: dict[str, Any] = {
+                existing = existing_records.get(task_uuid)
+                directory_name = (
+                    str(existing.get("directory"))
+                    if existing and existing.get("directory")
+                    else f"{ordinal:03d}-{safe_name(task_title)}-{task_uuid[:8]}"
+                )
+                task_dir = run_dir / directory_name
+                task_dir.mkdir(parents=True, exist_ok=True)
+                record: dict[str, Any] = existing or {
                     "ordinal": ordinal,
                     "uuid": task_uuid,
                     "title": task_title,
@@ -301,25 +385,42 @@ def _run(args: argparse.Namespace) -> Path:
                     "directory": task_dir.name,
                 }
                 print(f"[{ordinal}/{len(tasks)}] {task_title}")
-                detail = task
-                try:
-                    detail = client.task_detail(str(module["uuid"]), task_uuid)
-                except Exception as exc:
-                    record["source_error"] = str(exc)
-                    print(f"  Не удалось получить JSON условия: {exc}", file=sys.stderr)
-                record["source"] = save_task_source(task_dir, detail)
-                try:
-                    record["capture"] = capture_task_page(
-                        page,
-                        client.task_url(str(module["uuid"]), task_uuid),
-                        detail,
-                        task_dir,
-                        timeout_ms,
-                        client.refresh_authentication,
-                    )
-                except Exception as exc:
-                    record["capture"] = {"status": "error", "reason": str(exc)}
-                    print(f"  Ошибка: {exc}", file=sys.stderr)
+                if (
+                    record.get("solution", {}).get("status") == "solved"
+                    and (task_dir / "solution.txt").is_file()
+                ):
+                    print("  Уже готово, пропуск")
+                    continue
+
+                detail = _load_task_json(task_dir)
+                if detail is None:
+                    detail = task
+                    try:
+                        detail = client.task_detail(str(module["uuid"]), task_uuid)
+                    except Exception as exc:
+                        error = _safe_error(exc)
+                        record["source_error"] = error
+                        print(f"  Не удалось получить JSON условия: {error}", file=sys.stderr)
+                    record["source"] = save_task_source(task_dir, detail)
+
+                disk_capture = _capture_from_disk(task_dir)
+                if disk_capture is not None:
+                    record["capture"] = disk_capture
+                    print("  Используются сохранённые скриншоты")
+                else:
+                    try:
+                        record["capture"] = capture_task_page(
+                            page,
+                            client.task_url(str(module["uuid"]), task_uuid),
+                            detail,
+                            task_dir,
+                            timeout_ms,
+                            client.refresh_authentication,
+                        )
+                    except Exception as exc:
+                        error = _safe_error(exc)
+                        record["capture"] = {"status": "error", "reason": error}
+                        print(f"  Ошибка: {error}", file=sys.stderr)
                 if args.solve_with_codex:
                     screenshots = capture_screenshots(task_dir, record["capture"])
                     try:
@@ -335,14 +436,23 @@ def _run(args: argparse.Namespace) -> Path:
                     except CodexError as exc:
                         record["solution"] = {"status": "error", "reason": str(exc)}
                         print(f"  Ошибка Codex: {exc}", file=sys.stderr)
-                manifest["tasks"].append(record)
-                write_json(run_dir / "manifest.json", manifest)
+                if existing is None:
+                    manifest["tasks"].append(record)
+                    existing_records[task_uuid] = record
+                manifest["tasks"].sort(key=lambda item: int(item.get("ordinal", 0)))
+                write_json(manifest_path, manifest)
                 time.sleep(0.2)
             _save_auth_state(context, args.auth_state)
             return run_dir
         finally:
-            context.close()
-            browser.close()
+            try:
+                context.close()
+            except PlaywrightError:
+                pass
+            try:
+                browser.close()
+            except PlaywrightError:
+                pass
 
 
 def main() -> None:
