@@ -1,10 +1,21 @@
-import subprocess
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
-from auto_hdp.codex_solver import capture_screenshots, solve_with_codex
+from openai_codex import LocalImageInput, Sandbox, TextInput
+from openai_codex.types import ReasoningEffort
+
+from auto_hdp.codex_solver import (
+    DEFAULT_CODEX_EFFORT,
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_CODEX_PROMPT,
+    _run_codex_turn,
+    capture_screenshots,
+    solve_with_codex,
+)
 
 
 class CodexSolverTest(unittest.TestCase):
@@ -35,26 +46,61 @@ class CodexSolverTest(unittest.TestCase):
             screenshot.write_bytes(b"png")
             output = directory / "solution.txt"
 
-            def fake_run(command, **_kwargs):
-                message_path = Path(command[command.index("--output-last-message") + 1])
-                message_path.write_text("Готовый ответ", encoding="utf-8")
-                return subprocess.CompletedProcess(command, 0, "", "")
+            with patch(
+                "auto_hdp.codex_solver._run_codex_turn",
+                new_callable=AsyncMock,
+                return_value="Готовый ответ",
+            ) as run:
+                result = solve_with_codex([screenshot], output, timeout_seconds=20)
 
-            with patch("auto_hdp.codex_solver.subprocess.run", side_effect=fake_run) as run:
-                result = solve_with_codex(
-                    "/usr/bin/codex",
-                    [screenshot],
-                    output,
-                    prompt="Реши",
-                    timeout_seconds=20,
+            self.assertEqual(run.await_args.kwargs["model"], "gpt-5.6-terra")
+            self.assertEqual(run.await_args.kwargs["effort"], "low")
+            self.assertIn("без Markdown", run.await_args.kwargs["prompt"])
+            self.assertEqual(output.read_text(encoding="utf-8"), "Готовый ответ\n")
+            self.assertEqual(result["provider"], "openai-codex-python-sdk")
+            self.assertEqual(result["reasoning_effort"], "low")
+
+    def test_sdk_turn_sends_prompt_and_local_images_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            screenshot = directory / "page.png"
+            screenshot.write_bytes(b"png")
+            observed = {}
+
+            class FakeThread:
+                async def run(self, inputs, **kwargs):
+                    observed["inputs"] = inputs
+                    observed["run"] = kwargs
+                    return SimpleNamespace(final_response="Ответ")
+
+            class FakeCodex:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_args):
+                    return None
+
+                async def thread_start(self, **kwargs):
+                    observed["start"] = kwargs
+                    return FakeThread()
+
+            with patch("auto_hdp.codex_solver.AsyncCodex", return_value=FakeCodex()):
+                answer = asyncio.run(
+                    _run_codex_turn(
+                        [screenshot],
+                        prompt=DEFAULT_CODEX_PROMPT,
+                        model=DEFAULT_CODEX_MODEL,
+                        effort=DEFAULT_CODEX_EFFORT,
+                        working_directory=directory,
+                    )
                 )
 
-            command = run.call_args.args[0]
-            self.assertIn("--ephemeral", command)
-            self.assertIn("read-only", command)
-            self.assertEqual(command[-1], "Реши")
-            self.assertEqual(output.read_text(encoding="utf-8"), "Готовый ответ\n")
-            self.assertEqual(result["status"], "solved")
+            self.assertEqual(answer, "Ответ")
+            self.assertIsInstance(observed["inputs"][0], TextInput)
+            self.assertIsInstance(observed["inputs"][1], LocalImageInput)
+            self.assertEqual(observed["start"]["model"], "gpt-5.6-terra")
+            self.assertEqual(observed["start"]["sandbox"], Sandbox.read_only)
+            self.assertEqual(observed["run"]["effort"], ReasoningEffort.low)
 
 
 if __name__ == "__main__":

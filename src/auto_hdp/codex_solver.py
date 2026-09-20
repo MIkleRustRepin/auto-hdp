@@ -1,30 +1,48 @@
 from __future__ import annotations
 
-import shutil
-import subprocess
+import asyncio
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from openai_codex import AsyncCodex, Codex, CodexConfig, LocalImageInput, Sandbox, TextInput
+from openai_codex.errors import CodexError as SdkCodexError
+from openai_codex.types import ReasoningEffort
+
+
+DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
+DEFAULT_CODEX_EFFORT = "low"
+CODEX_REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+DEFAULT_CODEX_PROMPT = (
+    "Реши задание на приложенных скриншотах. Верни только готовый ответ обычным "
+    "чистым текстом: без Markdown, заголовков, списочной разметки, жирного или "
+    "курсивного выделения, обратных кавычек и декоративного оформления. Используй "
+    "выделение или специальное оформление только если этого прямо требует условие "
+    "задания. Не описывай работу с файлами и не отправляй ответ на сайт."
+)
+
 
 class CodexError(RuntimeError):
-    """Codex CLI is unavailable, unauthenticated, or failed to solve a task."""
+    """Codex SDK is unavailable, unauthenticated, or failed to solve a task."""
 
 
-def codex_connection() -> str:
-    executable = shutil.which("codex")
-    if not executable:
-        raise CodexError("Codex CLI не найден. Установите его и выполните: codex login")
-    result = subprocess.run(
-        [executable, "login", "status"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise CodexError("Codex CLI не авторизован. Выполните: codex login")
-    return executable
+def codex_connection(model: str = DEFAULT_CODEX_MODEL) -> None:
+    """Start the Python SDK and verify that the requested model is available."""
+    try:
+        with Codex() as codex:
+            response = codex.models(include_hidden=False)
+    except Exception as exc:
+        raise CodexError(
+            "Не удалось подключить Codex Python SDK. Выполните codex login"
+        ) from exc
+
+    available = {
+        item.model
+        for item in response.data
+        if isinstance(getattr(item, "model", None), str)
+    }
+    if model not in available:
+        raise CodexError(f"Модель {model!r} недоступна в текущей сессии Codex")
 
 
 def capture_screenshots(directory: Path, capture: dict[str, Any]) -> list[Path]:
@@ -50,65 +68,77 @@ def capture_screenshots(directory: Path, capture: dict[str, Any]) -> list[Path]:
     return result
 
 
+async def _run_codex_turn(
+    screenshots: list[Path],
+    *,
+    prompt: str,
+    model: str,
+    effort: str,
+    working_directory: Path,
+) -> str:
+    inputs = [TextInput(prompt)]
+    inputs.extend(LocalImageInput(str(path.resolve())) for path in screenshots)
+    config = CodexConfig(cwd=str(working_directory))
+    async with AsyncCodex(config) as codex:
+        thread = await codex.thread_start(
+            cwd=str(working_directory),
+            ephemeral=True,
+            model=model,
+            sandbox=Sandbox.read_only,
+        )
+        result = await thread.run(
+            inputs,
+            effort=ReasoningEffort(effort),
+            model=model,
+            sandbox=Sandbox.read_only,
+        )
+    return result.final_response
+
+
 def solve_with_codex(
-    executable: str,
     screenshots: list[Path],
     output_path: Path,
     *,
-    prompt: str = "Реши",
-    model: str | None = None,
+    prompt: str = DEFAULT_CODEX_PROMPT,
+    model: str = DEFAULT_CODEX_MODEL,
+    effort: str = DEFAULT_CODEX_EFFORT,
     timeout_seconds: int = 600,
 ) -> dict[str, Any]:
     if not screenshots:
         raise CodexError("Нет скриншотов для отправки в Codex")
 
-    with tempfile.TemporaryDirectory(prefix="auto-hdp-codex-") as temporary:
-        temporary_dir = Path(temporary)
-        last_message = temporary_dir / "last-message.txt"
-        command = [
-            executable,
-            "exec",
-            "--ephemeral",
-            "--sandbox",
-            "read-only",
-            "--skip-git-repo-check",
-            "--color",
-            "never",
-            "--cd",
-            str(temporary_dir),
-            "--output-last-message",
-            str(last_message),
-        ]
-        if model:
-            command.extend(["--model", model])
-        for screenshot in screenshots:
-            command.extend(["--image", str(screenshot.resolve())])
-        command.extend(["--", prompt])
+    if effort not in CODEX_REASONING_EFFORTS:
+        raise CodexError(f"Неизвестный уровень reasoning: {effort!r}")
 
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=max(1, timeout_seconds),
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise CodexError(f"Codex не ответил за {timeout_seconds} секунд") from exc
-        if result.returncode != 0:
-            message = (result.stderr or result.stdout or "неизвестная ошибка").strip()
-            raise CodexError(f"Codex завершился с ошибкой: {message[-2000:]}")
-        if not last_message.is_file():
-            raise CodexError("Codex не создал итоговый ответ")
-        answer = last_message.read_text(encoding="utf-8").strip()
-        if not answer:
-            raise CodexError("Codex вернул пустой ответ")
+    try:
+        with tempfile.TemporaryDirectory(prefix="auto-hdp-codex-") as temporary:
+            answer = asyncio.run(
+                asyncio.wait_for(
+                    _run_codex_turn(
+                        screenshots,
+                        prompt=prompt,
+                        model=model,
+                        effort=effort,
+                        working_directory=Path(temporary),
+                    ),
+                    timeout=max(1, timeout_seconds),
+                )
+            ).strip()
+    except TimeoutError as exc:
+        raise CodexError(f"Codex не ответил за {timeout_seconds} секунд") from exc
+    except SdkCodexError as exc:
+        raise CodexError(f"Codex Python SDK завершился с ошибкой: {exc}") from exc
+    except (OSError, RuntimeError) as exc:
+        raise CodexError(f"Не удалось запустить Codex Python SDK: {exc}") from exc
 
+    if not answer:
+        raise CodexError("Codex вернул пустой ответ")
     output_path.write_text(f"{answer}\n", encoding="utf-8")
     return {
         "status": "solved",
-        "provider": "codex-cli",
-        "model": model or "configured-default",
+        "provider": "openai-codex-python-sdk",
+        "model": model,
+        "reasoning_effort": effort,
         "prompt": prompt,
         "screenshots": [path.name for path in screenshots],
         "output": output_path.name,

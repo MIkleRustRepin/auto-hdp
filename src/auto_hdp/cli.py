@@ -15,6 +15,10 @@ from playwright.sync_api import Browser, BrowserType, Error as PlaywrightError, 
 
 from .capture import capture_task_page, safe_name, save_task_source, write_json
 from .codex_solver import (
+    CODEX_REASONING_EFFORTS,
+    DEFAULT_CODEX_EFFORT,
+    DEFAULT_CODEX_MODEL,
+    DEFAULT_CODEX_PROMPT,
     CodexError,
     capture_screenshots,
     codex_connection,
@@ -67,16 +71,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--solve-with-codex",
         "--codex",
         action="store_true",
-        help="Отправить скриншоты каждого выбранного задания в Codex CLI",
+        help="Отправить скриншоты каждого выбранного задания через Codex Python SDK",
     )
     parser.add_argument(
         "--codex-prompt",
-        default="Реши",
+        default=DEFAULT_CODEX_PROMPT,
         help="Текст, отправляемый в Codex вместе со скриншотами",
     )
     parser.add_argument(
         "--codex-model",
-        help="Модель Codex; без аргумента используется модель из конфигурации Codex CLI",
+        default=DEFAULT_CODEX_MODEL,
+        help=f"Модель Codex SDK (по умолчанию: {DEFAULT_CODEX_MODEL})",
+    )
+    parser.add_argument(
+        "--codex-effort",
+        choices=CODEX_REASONING_EFFORTS,
+        default=DEFAULT_CODEX_EFFORT,
+        help=f"Уровень reasoning (по умолчанию: {DEFAULT_CODEX_EFFORT})",
     )
     parser.add_argument(
         "--codex-timeout",
@@ -181,7 +192,8 @@ def _run(args: argparse.Namespace) -> Path:
     login = os.getenv("HDP_LOGIN", "").strip()
     password = os.getenv("HDP_PASSWORD", "")
     cached_state = _read_auth_state(args.auth_state)
-    codex_executable = codex_connection() if args.solve_with_codex else None
+    if args.solve_with_codex:
+        codex_connection(args.codex_model)
 
     timeout_ms = max(1, args.timeout) * 1_000
     with sync_playwright() as playwright:
@@ -260,8 +272,13 @@ def _run(args: argparse.Namespace) -> Path:
                 },
                 "solver": {
                     "enabled": args.solve_with_codex,
-                    "provider": "codex-cli" if args.solve_with_codex else None,
+                    "provider": "openai-codex-python-sdk"
+                    if args.solve_with_codex
+                    else None,
                     "model": args.codex_model if args.solve_with_codex else None,
+                    "reasoning_effort": args.codex_effort
+                    if args.solve_with_codex
+                    else None,
                     "prompt": args.codex_prompt if args.solve_with_codex else None,
                 },
                 "tasks": [],
@@ -303,15 +320,15 @@ def _run(args: argparse.Namespace) -> Path:
                 except Exception as exc:
                     record["capture"] = {"status": "error", "reason": str(exc)}
                     print(f"  Ошибка: {exc}", file=sys.stderr)
-                if codex_executable is not None:
+                if args.solve_with_codex:
                     screenshots = capture_screenshots(task_dir, record["capture"])
                     try:
                         record["solution"] = solve_with_codex(
-                            codex_executable,
                             screenshots,
                             task_dir / "solution.txt",
                             prompt=args.codex_prompt,
                             model=args.codex_model,
+                            effort=args.codex_effort,
                             timeout_seconds=args.codex_timeout,
                         )
                         print(f"  Codex: {task_dir / 'solution.txt'}")
